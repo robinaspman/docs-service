@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docs + Voice Flow service (Images + OCR + Autofill/status endpoints)
+Docs + Voice Flow service (Images + OCR + Autofill/status endpoints + File logging/URLs)
 
-Features:
-- OFFERT / ORDER / INVOICE PDF generation (ReportLab) with pixel-perfect alignment + global spacing
-- Frontend-driven layout overrides + image placement
+Adds:
+- Flow status/history & list:  GET /flows, GET /flow/{id}
+- File logging + public URLs:  every generated/ uploaded file logged and returned with absolute URLs
+- Autofill endpoint:           POST /autofill/offer (text or partial offer; optional flow_id to update)
+- Root route:                  GET /  (friendly JSON)
+Keeps:
+- Offert / Order / Invoice PDF generation (ReportLab), alignment + global spacing controls
+- Image support with captions + placement
 - Voice-first flow (STT) + text fallback
-- OCR endpoints (PDF/Image): /ocr/analyze, /ocr/offer-draft, /flow/start-ocr
-- Autofill + status endpoints for 3-column UI:
-    * /flow/send-offer/{id}            -> mark "Sent"
-    * /flow/generate-order/{id}        -> build Order from Offer (autofill), return order JSON + PDF
-    * /flow/generate-invoice/{id}      -> build Invoice from Offer/Order (autofill), return invoice JSON + PDF + pricing
-    * /flow/{id}                       -> read current flow state/status
-- Existing orchestration:
-    * /flow/start                      -> voice/text → draft offer
-    * /flow/create-offer/{id}          -> Offert PDF from offer+layout+images
-    * /flow/confirm/{id}               -> Order + Invoice (both) + pricing
-- Uploads API: /assets/upload (images/PDF) and static serving (if not serverless)
+- OCR endpoints (PDF/Image):   /ocr/analyze, /ocr/offer-draft, /flow/start-ocr, /ocr/receipt-draft
+- Stepwise UI endpoints:       /flow/send-offer, /flow/generate-order, /flow/generate-invoice
 """
 
 import io, os, re, json, shutil, base64, mimetypes
@@ -39,7 +35,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # -------- API / Schema -------------
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -73,17 +69,17 @@ except Exception:
     pass
 
 # =========================================================
-# File storage for uploads (served under /assets)
+# File storage (uploads + generated) with public mounts
 # =========================================================
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+GENERATED_DIR = os.getenv("GENERATED_DIR", "generated")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(GENERATED_DIR, exist_ok=True)
 
 # =========================================================
 # Global alignment control
 # =========================================================
-# Set to 2*mm to align with the "Tjänst" TEXT start (recommended).
-# Set to 0 to align with the blue band's left edge instead.
-LEFT_ALIGN_PAD = 2 * mm
+LEFT_ALIGN_PAD = 2 * mm  # set 0 to align with the blue band edge
 
 # =========================================================
 # Global spacing controls (points)
@@ -107,7 +103,6 @@ SPC_AFTER_GDPR_RELAXED    = 6
 SPC_AFTER_VALIDITY_COMPACT = 10
 SPC_AFTER_VALIDITY_RELAXED = 12
 
-# Blue side panel defaults
 SPC_PANEL_TITLE_AFTER_COMPACT = 4
 SPC_PANEL_TITLE_AFTER_RELAXED = 6
 SPC_PANEL_INNER_PAD = 5
@@ -148,7 +143,7 @@ def _now_iso() -> str:
 OPENAI_MODEL_STT     = os.getenv("OPENAI_MODEL_STT", "gpt-4o-mini-transcribe")
 OPENAI_MODEL_TTS     = os.getenv("OPENAI_MODEL_TTS", "gpt-4o-mini-tts")
 OPENAI_MODEL_PARSER  = os.getenv("OPENAI_MODEL_PARSER", "gpt-4o-mini")
-OPENAI_MODEL_VISION  = os.getenv("OPENAI_MODEL_VISION", "gpt-4.1-mini")  # for OCR via vision
+OPENAI_MODEL_VISION  = os.getenv("OPENAI_MODEL_VISION", "gpt-4.1-mini")
 _client = None
 if OpenAI and os.getenv("OPENAI_API_KEY"):
     _client = OpenAI()
@@ -156,7 +151,7 @@ if OpenAI and os.getenv("OPENAI_API_KEY"):
 # =========================================================
 # App + CORS + Static files
 # =========================================================
-app = FastAPI(title="Docs Service (Alignment + Images + Voice + OCR + Autofill)")
+app = FastAPI(title="Docs Service (Alignment + Images + Voice + OCR + Autofill + Logs)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -164,8 +159,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Static serving for uploaded assets (skip if you later go serverless)
+# Static serving (uploads + generated)
 app.mount("/assets", StaticFiles(directory=UPLOAD_DIR), name="assets")
+app.mount("/generated", StaticFiles(directory=GENERATED_DIR), name="generated")
 
 # =========================================================
 # Helpers
@@ -300,11 +296,11 @@ def styles_generic(base_font: str, compact: bool = True) -> dict:
 def _get_layout_overrides(layout: Dict[str, Any], compact: bool):
     left_align_pad = (layout.get("left_align_pad_mm", (LEFT_ALIGN_PAD / mm)) * mm)
 
-    def pair(key: str, d_compact: float, d_relaxed: float):
+    def pair(key: str, d_compact: float, d_relax: float):
         v = layout.get("spacing", {}).get(key)
         if isinstance(v, (int, float)): return float(v), float(v)
-        if isinstance(v, dict): return float(v.get("compact", d_compact)), float(v.get("relaxed", d_relaxed))
-        return d_compact, d_relaxed
+        if isinstance(v, dict): return float(v.get("compact", d_compact)), float(v.get("relaxed", d_relax))
+        return d_compact, d_relax
 
     sp_after_logo       = pair("after_logo",       SPC_AFTER_LOGO_COMPACT,       SPC_AFTER_LOGO_RELAXED)
     sp_after_title      = pair("after_title",      SPC_AFTER_TITLE_COMPACT,      SPC_AFTER_TITLE_RELAXED)
@@ -317,11 +313,9 @@ def _get_layout_overrides(layout: Dict[str, Any], compact: bool):
     sp_after_validity   = pair("after_validity",   SPC_AFTER_VALIDITY_COMPACT,   SPC_AFTER_VALIDITY_RELAXED)
 
     panel = layout.get("panel", {})
-    panel_title_after_c = float(panel.get("panel_title_after_compact", SPC_PANEL_TITLE_AFTER_COMPACT))
-    panel_title_after_r = float(panel.get("panel_title_after_relaxed", SPC_PANEL_TITLE_AFTER_RELAXED))
-    panel_title_after   = panel.get("panel_title_after",
-                                    panel_title_after_c if compact else panel_title_after_r)
-    panel_inner_pad = float(panel.get("inner_pad", SPC_PANEL_INNER_PAD))
+    panel_title_after = float(panel.get("panel_title_after",
+                             (SPC_PANEL_TITLE_AFTER_COMPACT if compact else SPC_PANEL_TITLE_AFTER_RELAXED)))
+    panel_inner_pad   = float(panel.get("inner_pad", SPC_PANEL_INNER_PAD))
 
     tbl = layout.get("table", {})
     tbl_head_top    = float(tbl.get("head_top_pad",    pick(compact, TBL_HEAD_TOP_PAD_COMPACT,    TBL_HEAD_TOP_PAD_RELAXED)))
@@ -609,7 +603,7 @@ def build_offer_template_pdf(data: dict, outpath: str):
     story.append(Paragraph("OFFERT", st["OfferTitle"]))
     story.append(Spacer(1, L["after_title"]))
 
-    # Header meta + optional panel
+    # Header meta + panel
     frame_w = float(doc.width)
     label_w = 36 * mm if compact else 38 * mm
     gap_w = 3 * mm
@@ -812,8 +806,6 @@ def build_order_pdf(p: "OrderPayload", outpath: str):
         ("BOTTOMPADDING", (0,1), (-1,-1), pick(p.compact, ORDINV_ROW_BOTTOM_PAD_COMPACT,  ORDINV_ROW_BOTTOM_PAD_RELAXED)),
     ]))
     story.append(tbl)
-
-    # Optional: images for order sections if you later add them (not commonly used)
     doc.build(story)
 
 def build_invoice_pdf(p: "InvoicePayload", outpath: str):
@@ -847,51 +839,108 @@ def build_invoice_pdf(p: "InvoicePayload", outpath: str):
     ]))
     story.append(tbl)
 
-    # totals
     story.append(Spacer(1, pick(p.compact, SPC_AFTER_ITEMS_COMPACT, SPC_AFTER_ITEMS_RELAXED)))
     story.append(Paragraph(f"Exkl. moms: {fmt_currency(pricing.subtotal_ex_vat)}", st["Body"]))
     if p.rot_applies:
         story.append(Paragraph(f"ROT-avdrag ({int(p.rot_percent*100)}% på arbete): -{fmt_currency(pricing.rot_deduction)}", st["Body"]))
     story.append(Paragraph(f"Moms ({int(p.vat_rate*100)}%): {fmt_currency(pricing.vat_amount)}", st["Body"]))
     story.append(Paragraph(f"<b>Att betala:</b> {fmt_currency(pricing.total_due)}", st["Strong"]))
-
     doc.build(story)
+
+# =========================================================
+# Public URL helpers + file logging
+# =========================================================
+FILE_LOG: List[Dict[str, Any]] = []  # [{time, type, flow_id, filename, rel_url, abs_url, path}]
+
+def _rel_url_for_path(path: str) -> Optional[str]:
+    # Normalize absolute to relative served URL
+    abspath = os.path.abspath(path)
+    up = os.path.abspath(UPLOAD_DIR)
+    gp = os.path.abspath(GENERATED_DIR)
+    if abspath.startswith(up + os.sep):
+        return f"/assets/{os.path.basename(path)}"
+    if abspath.startswith(gp + os.sep):
+        return f"/generated/{os.path.basename(path)}"
+    # Already a served url?
+    if path.startswith("/assets/") or path.startswith("/generated/"):
+        return path
+    return None
+
+def _abs_url(request: Request, rel_url: Optional[str]) -> Optional[str]:
+    if not rel_url: return None
+    base = str(request.base_url).rstrip("/")
+    return f"{base}{rel_url}"
+
+def _log_file(kind: str, flow_id: Optional[str], path: str, request: Optional[Request] = None):
+    rel = _rel_url_for_path(path)
+    absu = _abs_url(request, rel) if request else None
+    FILE_LOG.append({
+        "time": _now_iso(),
+        "type": kind,
+        "flow_id": flow_id,
+        "filename": os.path.basename(path),
+        "rel_url": rel,
+        "abs_url": absu,
+        "path": path,
+    })
 
 # =========================================================
 # API: Offer/Order/Invoice (existing)
 # =========================================================
 @app.post("/offer")
-def create_offer(payload: OfferPayload):
-    out = f"generated/Offert_{payload.customer.name}_{payload.date}.pdf"
+def create_offer(payload: OfferPayload, request: Request):
+    out = os.path.join(GENERATED_DIR, f"Offert_{payload.customer.name}_{payload.date}.pdf")
     safe_mkdir(out)
     build_offer_template_pdf(offer_payload_to_template_data(payload), out)
     totals = sum(i.line_total() for i in payload.items)
-    return JSONResponse({"ok": True, "pdf_path": out, "totals_ex_vat": totals})
+    _log_file("offer_pdf", None, out, request)
+    return JSONResponse({"ok": True, "pdf_path": out,
+                         "pdf_url": _abs_url(request, _rel_url_for_path(out)),
+                         "totals_ex_vat": totals})
 
 @app.post("/order")
-def create_order(payload: OrderPayload):
-    out = f"generated/Order_{payload.customer.name}_{payload.date}.pdf"
+def create_order(payload: OrderPayload, request: Request):
+    out = os.path.join(GENERATED_DIR, f"Order_{payload.customer.name}_{payload.date}.pdf")
     safe_mkdir(out)
     build_order_pdf(payload, out)
-    return JSONResponse({"ok": True, "pdf_path": out})
+    _log_file("order_pdf", None, out, request)
+    return JSONResponse({"ok": True, "pdf_path": out,
+                         "pdf_url": _abs_url(request, _rel_url_for_path(out))})
 
 @app.post("/invoice")
-def create_invoice(payload: InvoicePayload):
-    out = f"generated/Faktura_{payload.customer.name}_{payload.date}.pdf"
+def create_invoice(payload: InvoicePayload, request: Request):
+    out = os.path.join(GENERATED_DIR, f"Faktura_{payload.customer.name}_{payload.date}.pdf")
     safe_mkdir(out)
     pricing = compute_pricing(payload.items, payload.vat_rate, payload.rot_applies, payload.rot_percent)
     build_invoice_pdf(payload, out)
-    return JSONResponse({"ok": True, "pdf_path": out, "pricing": pricing.dict()})
+    _log_file("invoice_pdf", None, out, request)
+    return JSONResponse({"ok": True, "pdf_path": out,
+                         "pdf_url": _abs_url(request, _rel_url_for_path(out)),
+                         "pricing": pricing.dict()})
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "docs-service",
+        "docs": "/docs",
+        "endpoints": [
+            "/flow/start", "/flow/create-offer/{id}", "/flow/send-offer/{id}",
+            "/flow/generate-order/{id}", "/flow/generate-invoice/{id}",
+            "/flow/{id}", "/flows", "/files",
+            "/ocr/analyze", "/ocr/offer-draft", "/ocr/receipt-draft", "/flow/start-ocr",
+        ]
+    }
 
 # =========================================================
 # Uploads API
 # =========================================================
 @app.post("/assets/upload")
-async def assets_upload(file: UploadFile = File(...), desired_name: Optional[str] = Form(None)):
+async def assets_upload(request: Request, file: UploadFile = File(...), desired_name: Optional[str] = Form(None)):
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in (*IMAGE_EXTS, *PDF_EXTS):
         raise HTTPException(400, f"Unsupported file type: {ext}")
@@ -901,7 +950,10 @@ async def assets_upload(file: UploadFile = File(...), desired_name: Optional[str
     fpath = os.path.join(UPLOAD_DIR, fname)
     with open(fpath, "wb") as out:
         shutil.copyfileobj(io.BytesIO(await file.read()), out)
-    return {"ok": True, "path": f"/assets/{fname}", "filename": fname}
+    rel = f"/assets/{fname}"
+    absu = _abs_url(request, rel)
+    _log_file("upload", None, fpath, request)
+    return {"ok": True, "path": fpath, "rel_url": rel, "abs_url": absu, "filename": fname}
 
 # =========================================================
 # Voice + NLP (existing)
@@ -1066,10 +1118,6 @@ def _file_ext(fn: str) -> str:
 # =========================================================
 @app.post("/ocr/analyze")
 async def ocr_analyze(file: UploadFile = File(None), method: str = Form("auto"), lang: str = Form("swe+eng")):
-    """
-    Upload a PDF or image; get raw text.
-    method: auto | tesseract | openai
-    """
     if file is None:
         raise HTTPException(400, "Send a file")
     fn = file.filename or "upload"
@@ -1081,25 +1129,21 @@ async def ocr_analyze(file: UploadFile = File(None), method: str = Form("auto"),
 
     if method == "tesseract":
         if ext in PDF_EXTS:
-            text = _pdf_ocr_tesseract(data, lang=lang)
-            used = "tesseract_pdf"
+            text = _pdf_ocr_tesseract(data, lang=lang); used = "tesseract_pdf"
         else:
-            text = _img_ocr_tesseract(data, lang=lang)
-            used = "tesseract_img"
+            text = _img_ocr_tesseract(data, lang=lang); used = "tesseract_img"
 
     elif method == "openai":
         if ext in PDF_EXTS:
             t = _pdf_extract_text(data)
             if not t and HAS_TESS and HAS_PDF2IMG:
-                text = _pdf_ocr_tesseract(data, lang=lang)
-                used = "openai_fallback_tesseract_pdf"
+                text = _pdf_ocr_tesseract(data, lang=lang); used = "openai_fallback_tesseract_pdf"
             elif not t:
                 raise HTTPException(400, "OpenAI OCR for PDFs needs page images; install poppler+tesseract or upload as image.")
             else:
                 text = t; used = "pdf_text"
         else:
-            text = _ocr_openai(data, fn)
-            used = "openai_vision"
+            text = _ocr_openai(data, fn); used = "openai_vision"
 
     else:  # auto
         if ext in PDF_EXTS:
@@ -1127,17 +1171,12 @@ async def ocr_analyze(file: UploadFile = File(None), method: str = Form("auto"),
 
 @app.post("/ocr/offer-draft")
 async def ocr_offer_draft(file: UploadFile = File(None), text: Optional[str] = Form(None), lang: str = Form("swe+eng")):
-    """
-    Build an Offer JSON draft from a receipt/offer/invoice scan.
-    Provide either a file or direct text.
-    """
     if not text and not file:
         raise HTTPException(400, "Send a file or 'text'.")
 
     ocr_text = text or ""
     used = None
     if not ocr_text and file:
-        # auto OCR
         res = await ocr_analyze(file=file, method="auto", lang=lang)  # type: ignore
         ocr_text = res["text"]; used = res["meta"]["method_used"]
 
@@ -1222,9 +1261,6 @@ async def ocr_receipt_draft(file: UploadFile = File(None), text: Optional[str] =
 
 @app.post("/flow/start-ocr")
 async def flow_start_ocr(file: UploadFile = File(...), lang: str = Form("swe+eng")):
-    """
-    Start a flow from a scanned offer/receipt/invoice image or PDF.
-    """
     res = await ocr_analyze(file=file, method="auto", lang=lang)  # type: ignore
     text = res["text"]
     base_json = rule_based_offer_from_transcript(text)
@@ -1242,14 +1278,18 @@ async def flow_start_ocr(file: UploadFile = File(...), lang: str = Form("swe+eng
             "invoice_generated": False,
         },
         "timestamps": {"ocr_started_at": _now_iso()},
+        "history": [{"time": _now_iso(), "event": "flow_started_ocr"}],
         "ocr_meta": res["meta"]
     }
     return {"ok": True, "flow_id": flow_id, "transcript": text, "offer": base_json, "ocr": res["meta"]}
 
 # =========================================================
-# Orchestration flow
+# Orchestration flow + history + listing
 # =========================================================
 FLOWS: Dict[str, Dict[str, Any]] = {}
+
+def _flow_log(flow: Dict[str, Any], event: str, extra: Optional[Dict[str, Any]] = None):
+    flow.setdefault("history", []).append({"time": _now_iso(), "event": event, "data": extra or {}})
 
 @app.post("/flow/start")
 async def flow_start(audio: UploadFile = File(None),
@@ -1279,12 +1319,13 @@ async def flow_start(audio: UploadFile = File(None),
             "order_generated": False,
             "invoice_generated": False,
         },
-        "timestamps": {}
+        "timestamps": {"flow_started_at": _now_iso()},
+        "history": [{"time": _now_iso(), "event": "flow_started"}]
     }
     return {"ok": True, "flow_id": flow_id, "transcript": transcript, "offer": base_json}
 
 @app.post("/flow/create-offer/{flow_id}")
-async def flow_create_offfer(flow_id: str, payload: dict):
+async def flow_create_offfer(flow_id: str, request: Request, payload: dict):
     f = FLOWS.get(flow_id)
     if not f: raise HTTPException(404, "Flow not found.")
     offer = payload.get("offer") or f["offer"]
@@ -1296,15 +1337,22 @@ async def flow_create_offfer(flow_id: str, payload: dict):
         offer["services"] = [{"title": "Arbete", "hours": 8, "rate": 800}]
     offer["layout"] = layout
     offer["images"] = images
-    out = f"generated/Offert_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf"
+    out = os.path.join(GENERATED_DIR, f"Offert_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf")
     safe_mkdir(out)
     build_offer_template_pdf(offer, out)
     f["offer"] = offer; f["offer_pdf"] = out
     totals = sum(int(r["hours"] or 0) * float(r["rate"] or 0) for r in offer["services"])
-    return {"ok": True, "flow_id": flow_id, "offer_pdf": out, "totals_ex_vat": totals}
+    _flow_log(f, "offer_generated", {"totals_ex_vat": totals})
+    _log_file("offer_pdf", flow_id, out, request)
+    return {
+        "ok": True, "flow_id": flow_id,
+        "offer_pdf": out,
+        "offer_pdf_url": _abs_url(request, _rel_url_for_path(out)),
+        "totals_ex_vat": totals
+    }
 
 @app.post("/flow/confirm/{flow_id}")
-async def flow_confirm(flow_id: str):
+async def flow_confirm(flow_id: str, request: Request):
     f = FLOWS.get(flow_id)
     if not f: raise HTTPException(404, "Flow not found.")
     offer = f["offer"]
@@ -1317,10 +1365,12 @@ async def flow_confirm(flow_id: str):
         payment=Payment(**offer["payment"]), gdpr=offer.get("gdpr",""),
         compact=offer.get("compact", True), images=[ImageSpec(**img) for img in (offer.get("images") or [])]
     )
-    order_out = f"generated/Order_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf"
+    order_out = os.path.join(GENERATED_DIR, f"Order_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf")
     build_order_pdf(order_payload, order_out); f["order_pdf"] = order_out
     f.setdefault("status", {})["order_generated"] = True
     f.setdefault("timestamps", {})["order_generated_at"] = _now_iso()
+    _flow_log(f, "order_generated")
+    _log_file("order_pdf", flow_id, order_out, request)
 
     inv_payload = InvoicePayload(
         customer=Customer(**offer["customer"]), items=items, date=offer["date"],
@@ -1330,13 +1380,20 @@ async def flow_confirm(flow_id: str):
         rot_applies=offer.get("rot_applies", False), rot_percent=offer.get("rot_percent",0.30),
         images=[ImageSpec(**img) for img in (offer.get("images") or [])]
     )
-    invoice_out = f"generated/Faktura_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf"
+    invoice_out = os.path.join(GENERATED_DIR, f"Faktura_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf")
     pricing = compute_pricing(inv_payload.items, inv_payload.vat_rate, inv_payload.rot_applies, inv_payload.rot_percent)
     build_invoice_pdf(inv_payload, invoice_out)
     f["invoice_pdf"] = invoice_out; f["pricing"] = pricing.dict()
     f["status"]["invoice_generated"] = True
     f["timestamps"]["invoice_generated_at"] = _now_iso()
-    return {"ok": True, "flow_id": flow_id, "order_pdf": order_out, "invoice_pdf": invoice_out, "pricing": pricing.dict()}
+    _flow_log(f, "invoice_generated", {"pricing": pricing.dict()})
+    _log_file("invoice_pdf", flow_id, invoice_out, request)
+    return {
+        "ok": True, "flow_id": flow_id,
+        "order_pdf": order_out, "order_pdf_url": _abs_url(request, _rel_url_for_path(order_out)),
+        "invoice_pdf": invoice_out, "invoice_pdf_url": _abs_url(request, _rel_url_for_path(invoice_out)),
+        "pricing": pricing.dict()
+    }
 
 # =========================================================
 # Autofill helpers + new endpoints for 3-column UI
@@ -1392,62 +1449,136 @@ def flow_send_offer(flow_id: str):
     if not f: raise HTTPException(404, "Flow not found.")
     f.setdefault("status", {})["offer_sent"] = True
     f.setdefault("timestamps", {})["offer_sent_at"] = _now_iso()
+    _flow_log(f, "offer_sent")
     return {"ok": True, "flow_id": flow_id, "status": f["status"], "timestamps": f["timestamps"]}
 
 @app.post("/flow/generate-order/{flow_id}")
-def flow_generate_order(flow_id: str):
+def flow_generate_order(flow_id: str, request: Request):
     f = FLOWS.get(flow_id)
     if not f: raise HTTPException(404, "Flow not found.")
     offer = f["offer"]
     order_payload = _autofill_order_from_offer(offer)
-    out = f"generated/Order_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf"
+    out = os.path.join(GENERATED_DIR, f"Order_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf")
     build_order_pdf(order_payload, out)
     f["order_pdf"] = out
     f.setdefault("status", {})["order_generated"] = True
     f.setdefault("timestamps", {})["order_generated_at"] = _now_iso()
+    _flow_log(f, "order_generated_step")
+    _log_file("order_pdf", flow_id, out, request)
     return {
         "ok": True,
         "flow_id": flow_id,
         "order_pdf": out,
+        "order_pdf_url": _abs_url(request, _rel_url_for_path(out)),
         "order": order_payload.model_dump(),
         "status": f["status"]
     }
 
 @app.post("/flow/generate-invoice/{flow_id}")
-def flow_generate_invoice(flow_id: str):
+def flow_generate_invoice(flow_id: str, request: Request):
     f = FLOWS.get(flow_id)
     if not f: raise HTTPException(404, "Flow not found.")
     offer = f["offer"]
     order_payload = _autofill_order_from_offer(offer)
     inv_payload = _autofill_invoice_from_order(offer, order_payload)
-    out = f"generated/Faktura_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf"
+    out = os.path.join(GENERATED_DIR, f"Faktura_{offer['customer']['name']}_{offer['date']}_{flow_id}.pdf")
     pricing = compute_pricing(inv_payload.items, inv_payload.vat_rate, inv_payload.rot_applies, inv_payload.rot_percent)
     build_invoice_pdf(inv_payload, out)
     f["invoice_pdf"] = out
     f["pricing"] = pricing.dict()
     f.setdefault("status", {})["invoice_generated"] = True
     f.setdefault("timestamps", {})["invoice_generated_at"] = _now_iso()
+    _flow_log(f, "invoice_generated_step", {"pricing": pricing.dict()})
+    _log_file("invoice_pdf", flow_id, out, request)
     return {
         "ok": True,
         "flow_id": flow_id,
         "invoice_pdf": out,
+        "invoice_pdf_url": _abs_url(request, _rel_url_for_path(out)),
         "invoice": inv_payload.model_dump(),
         "pricing": pricing.dict(),
         "status": f["status"]
     }
 
+# --- Status APIs (polling-friendly) ---
 @app.get("/flow/{flow_id}")
-def flow_get(flow_id: str):
+def flow_get(flow_id: str, request: Request):
     f = FLOWS.get(flow_id)
     if not f: raise HTTPException(404, "Flow not found.")
+    def url_or_none(p): return _abs_url(request, _rel_url_for_path(p)) if p else None
     return {
         "ok": True,
         "flow_id": flow_id,
         "status": f.get("status", {}),
         "timestamps": f.get("timestamps", {}),
+        "history": f.get("history", []),
         "offer_pdf": f.get("offer_pdf"),
         "order_pdf": f.get("order_pdf"),
         "invoice_pdf": f.get("invoice_pdf"),
+        "offer_pdf_url": url_or_none(f.get("offer_pdf")),
+        "order_pdf_url": url_or_none(f.get("order_pdf")),
+        "invoice_pdf_url": url_or_none(f.get("invoice_pdf")),
         "pricing": f.get("pricing")
     }
+
+@app.get("/flows")
+def flows_list(request: Request):
+    out = []
+    for fid, f in FLOWS.items():
+        def url(p): return _abs_url(request, _rel_url_for_path(p)) if p else None
+        out.append({
+            "flow_id": fid,
+            "customer": f.get("offer", {}).get("customer", {}).get("name"),
+            "date": f.get("offer", {}).get("date"),
+            "status": f.get("status", {}),
+            "last_event": (f.get("history", [])[-1] if f.get("history") else None),
+            "offer_pdf_url": url(f.get("offer_pdf")),
+            "order_pdf_url": url(f.get("order_pdf")),
+            "invoice_pdf_url": url(f.get("invoice_pdf")),
+        })
+    return {"ok": True, "flows": out}
+
+@app.get("/files")
+def files_list():
+    # Last 100 files
+    return {"ok": True, "files": FILE_LOG[-100:]}
+
+# =========================================================
+# Autofill endpoint (text/partial → normalized offer, optional flow update)
+# =========================================================
+@app.post("/autofill/offer")
+async def autofill_offer(request: Request, payload: dict):
+    """
+    Body can contain:
+      - text:    free text (voice transcript / OCR)
+      - offer:   partial offer dict to merge with rule-based extraction
+      - flow_id: optional; if provided, updates the flow's offer and returns it
+    """
+    text = (payload or {}).get("text") or ""
+    partial = (payload or {}).get("offer") or {}
+    flow_id = (payload or {}).get("flow_id")
+
+    seed = rule_based_offer_from_transcript(text) if text else rule_based_offer_from_transcript("")
+    # Merge partial fields into seed (shallow merge for known keys)
+    for key in ["customer","date","offer_number","items","version","planned_start","delivery_time",
+                "payment","gdpr","validity_days","vat_rate","rot_applies","rot_percent","compact",
+                "logo_path","logo_dir","layout","images"]:
+        if key in partial and partial[key] is not None:
+            seed[key] = partial[key]
+
+    # Normalize items/services duality
+    if "services" not in seed and "items" in seed:
+        seed["services"] = [{"title": i.get("title",""), "hours": i.get("hours") or i.get("quantity",0), "rate": i.get("rate",0)} for i in seed["items"]]
+    if "items" not in seed and "services" in seed:
+        seed["items"] = [{"title": r.get("title",""), "hours": r.get("hours",0), "rate": r.get("rate",0), "type":"labour"} for r in seed["services"]]
+
+    if flow_id:
+        f = FLOWS.get(flow_id)
+        if not f: raise HTTPException(404, "Flow not found.")
+        f["offer"] = seed
+        f.setdefault("timestamps", {})["offer_autofilled_at"] = _now_iso()
+        _flow_log(f, "offer_autofilled", {"from_text": bool(text)})
+        return {"ok": True, "flow_id": flow_id, "offer": seed}
+
+    return {"ok": True, "offer": seed}
 
