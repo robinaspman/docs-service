@@ -1,0 +1,9 @@
+# keep Docker contexts small
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+node_modules
+.vscode
+.DS_Store
+

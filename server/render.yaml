@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: docs-service
+    env: docker
+    rootDirectory: server
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: GENERATED_DIR
+        value: /data/generated
+      - key: OCR_MODE
+        value: auto
+      - key: CORS_ALLOW_ORIGINS
+        value: https://YOUR-VERCEL-DOMAIN.vercel.app,https://YOUR-PREVIEW.vercel.app
+      - key: OPENAI_API_KEY        # set in dashboard after deploy (secret)
+        sync: false
+
